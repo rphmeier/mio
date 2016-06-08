@@ -24,6 +24,10 @@ pub struct NamedPipe {
     imp: PipeImp,
 }
 
+pub struct PipeListener {
+    imp: ListenerImp,
+}
+
 #[derive(Clone)]
 struct PipeImp {
     /// A stable address and synchronized access for all internals. This serves
@@ -40,19 +44,34 @@ struct PipeImp {
     inner: FromRawArc<StreamIo>,
 }
 
+#[derive(Clone)]
+struct ListenerImp {
+    inner: FromRawArc<ListenerIo>,
+}
+
 struct StreamIo {
     inner: Mutex<StreamInner>,
     read: Overlapped, // also used for connect
     write: Overlapped,
 }
 
+struct ListenerIo {
+    inner: Mutex<ListenerInner>,
+    accept: Overlapped,
+}
+
 struct StreamInner {
 	endpoint: String,
     pipe: miowpipe::NamedPipe,
     iocp: Registration,
-    deferred_connect: Option<SocketAddr>,
     read: State<Vec<u8>, Cursor<Vec<u8>>>,
     write: State<(Vec<u8>, usize), (Vec<u8>, usize)>,
+}
+
+struct ListenerInner {
+	endpoint: String,
+	accept: State<miowpipe::NamedPipe, miowpipe::NamedPipe>,
+    iocp: Registration,
 }
 
 enum State<T, U> {
@@ -85,10 +104,6 @@ impl NamedPipe {
 
     pub fn connect(endpoint: &str) -> io::Result<NamedPipe> {
         NamedPipe::new(endpoint)
-    }
-
-    pub fn try_clone(&self) -> io::Result<NamedPipe> {
-        NamedPipe::new(&self.inner().endpoint)
     }
 
     pub fn shutdown(&self) -> io::Result<()> {
@@ -380,6 +395,137 @@ impl Drop for NamedPipe {
         };
 
         // Then run any finalization code including level notifications
+        inner.iocp.deregister();
+    }
+}
+
+impl PipeListener {
+    pub fn new(endpoint: &str) -> io::Result<PipeListener> {
+        PipeListener {
+            imp: ListenerImp {
+                inner: FromRawArc::new(ListenerIo {
+                    accept: Overlapped::new(accept_done),
+                    inner: Mutex::new(ListenerInner {
+                        endpoint: endpoint.to_owned(),
+                        iocp: Registration::new(),
+                        accept: State::Empty,
+                    }),
+                }),
+            },
+        }
+    }
+
+    pub fn accept(&self) -> io::Result<Option<NamedPipe>> {
+        let mut me = self.inner();
+
+        let ret = match mem::replace(&mut me.accept, State::Empty) {
+            State::Empty => return Ok(None),
+            State::Pending(t) => {
+                me.accept = State::Pending(t);
+                return Ok(None)
+            }
+            State::Ready(p) => {
+                Ok(Some(NamedPipe::new(p, me.endpoint)))
+            }
+            State::Error(e) => Err(e),
+        };
+
+        self.imp.schedule_accept(&mut me);
+
+        return ret
+    }
+
+    fn inner(&self) -> MutexGuard<ListenerInner> {
+        self.imp.inner()
+    }
+}
+
+impl ListenerImp {
+    fn inner(&self) -> MutexGuard<ListenerInner> {
+        self.inner.inner.lock().unwrap()
+    }
+
+    fn schedule_accept(&self, me: &mut ListenerInner) {
+        match me.accept {
+            State::Empty => {}
+            _ => return
+        }
+
+        me.iocp.unset_readiness(EventSet::readable());
+
+		let pipe = try!(miowpipe::NamedPipeBuilder::new(endpoint).create());
+        match pipe.connect_overlapped(self.inner.accept.get_mut()) {
+            Ok(_) => {
+                // see docs above on StreamImp.inner for rationale on forget
+                me.accept = State::Pending(pipe);
+                mem::forget(self.clone());
+            }
+            Err(e) => {
+                me.accept = State::Error(e);
+                me.iocp.defer(EventSet::readable());
+            }
+        }
+    }
+
+    // See comments in StreamImp::push
+    fn push(&self, me: &mut ListenerInner, set: EventSet,
+            into: &mut Vec<IoEvent>) {
+        if me.pipe.as_raw_handle() != INVALID_PIPE {
+            me.iocp.push_event(set, into);
+        }
+    }
+}
+
+fn accept_done(status: &CompletionStatus, dst: &mut Vec<IoEvent>) {
+    let me2 = ListenerImp {
+        inner: unsafe { overlapped2arc!(status.overlapped(), ListenerIo, accept) },
+    };
+
+    let mut me = me2.inner();
+    let pipe = match mem::replace(&mut me.accept, State::Empty) {
+        State::Pending(s) => s,
+        _ => unreachable!(),
+    };
+    trace!("finished an accept");
+    me.accept = State::Ready(pipe);
+    me2.push(&mut me, EventSet::readable(), dst);
+}
+
+impl Evented for PipeListener {
+    fn register(&self, selector: &mut Selector, token: Token,
+                interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        let mut me = self.inner();
+        let me = &mut *me;
+        try!(me.iocp.register_socket(&me.socket, selector, token, interest,
+                                     opts));
+        self.imp.schedule_accept(me);
+        Ok(())
+    }
+
+    fn reregister(&self, selector: &mut Selector, token: Token,
+                  interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        let mut me = self.inner();
+        let me = &mut *me;
+        try!(me.iocp.reregister_socket(&me.socket, selector, token,
+                                       interest, opts));
+        self.imp.schedule_accept(me);
+        Ok(())
+    }
+
+    fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+        self.inner().iocp.checked_deregister(selector)
+    }
+}
+
+impl fmt::Debug for PipeListener {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        "PipeListener { ... }".fmt(f)
+    }
+}
+
+impl Drop for PipeListener {
+    fn drop(&mut self) {
+        // Run any finalization code including level notifications
         inner.iocp.deregister();
     }
 }
