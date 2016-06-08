@@ -144,6 +144,7 @@ mod awakener;
 mod selector;
 mod tcp;
 mod udp;
+mod pipe;
 mod from_raw_arc;
 mod buffer_pool;
 
@@ -151,6 +152,7 @@ pub use self::awakener::Awakener;
 pub use self::selector::{Events, Selector};
 pub use self::tcp::{TcpStream, TcpListener};
 pub use self::udp::UdpSocket;
+pub use self::pipe::NamedPipe;
 
 #[derive(Copy, Clone)]
 enum Family {

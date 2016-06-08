@@ -271,19 +271,38 @@ impl Registration {
         Ok(())
     }
 
-    pub fn reregister_socket(&mut self,
-                             _socket: &AsRawSocket,
-                             _selector: &mut Selector,
+    pub fn register_handle(&mut self,
+                           handle: &AsRawHandle,
+                           selector: &mut Selector,
+                           token: Token,
+                           interest: EventSet,
+                           opts: PollOpt) -> io::Result<()> {
+        if self.selector.is_some() {
+            return Err(other("handle already registered"))
+        }
+
+        try!(Registration::validate_opts(opts));
+        try!(selector.inner.port.add_handle(self.token.as_usize(), handle));
+        self.associate(selector, token);
+
+        if opts.is_level() {
+            self.key = Some(handle.as_raw_handle() as usize);
+        }
+
+        self.interest = set2mask(interest);
+        self.opts = opts;
+        Ok(())
+    }
+    pub fn reregister(&mut self,
                              token: Token,
                              interest: EventSet,
                              opts: PollOpt) -> io::Result<()> {
         if self.selector.is_none() {
-            return Err(other("socket not registered"))
+            return Err(other("handle not registered"))
         } else if self.token != token {
             return Err(other("cannot change token values on reregistration"))
         }
         try!(Registration::validate_opts(opts));
-        // TODO: assert that self.selector == selector?
 
         self.interest = set2mask(interest);
 
