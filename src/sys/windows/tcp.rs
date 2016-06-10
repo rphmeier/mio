@@ -285,11 +285,7 @@ fn read_done(status: &CompletionStatus, dst: &mut Vec<IoEvent>) {
 
             // If we transferred 0 bytes then be sure to indicate that hup
             // happened.
-            let mut e = EventSet::readable();
-
-            if status.bytes_transferred() == 0 {
-                e = e | EventSet::hup();
-            }
+            let e = EventSet::readable();
 
             return me2.push(&mut me, e, dst)
         }
