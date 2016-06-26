@@ -66,6 +66,7 @@ struct StreamInner {
     deferred_connect: Option<SocketAddr>,
     read: State<Vec<u8>, Cursor<Vec<u8>>>,
     write: State<(Vec<u8>, usize), (Vec<u8>, usize)>,
+	done: bool,
 }
 
 struct ListenerInner {
@@ -97,6 +98,7 @@ impl TcpStream {
                         deferred_connect: deferred_connect,
                         read: State::Empty,
                         write: State::Empty,
+						done: false,
                     }),
                 }),
             },
@@ -261,7 +263,7 @@ impl StreamImp {
     /// selector as otherwise it's just a spurious notification.
     fn push(&self, me: &mut StreamInner, set: EventSet,
             into: &mut Vec<IoEvent>) {
-        if me.socket.as_raw_socket() != INVALID_SOCKET {
+        if me.socket.as_raw_socket() != INVALID_SOCKET && !me.done {
             me.iocp.push_event(set, into);
         }
     }
@@ -424,9 +426,15 @@ impl Drop for TcpStream {
         // This is achieved by replacing our socket with an invalid one, so all
         // further operations will return an error (but no further operations
         // should be done anyway).
-        inner.socket = unsafe {
-            net::TcpStream::from_raw_socket(INVALID_SOCKET)
-        };
+        
+		// Closing socket at this point generates TCP RST so we shut it down instead
+		// and let it close after deregistration
+		inner.socket.shutdown(Shutdown::Both).ok();
+		inner.done = true;
+
+		//inner.socket = unsafe {
+        //    net::TcpStream::from_raw_socket(INVALID_SOCKET)
+        //};
 
         // Then run any finalization code including level notifications
         inner.iocp.deregister();
